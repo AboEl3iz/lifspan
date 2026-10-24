@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sk_buff Lifespan & IRQ/Sched Correlation Visualizer</title>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --panel-bg: #111827;
+            --accent-blue: #3b82f6;
+            --accent-purple: #8b5cf6;
+            --accent-amber: #f59e0b;
+            --accent-emerald: #10b981;
+            --accent-rose: #ef4444;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --border-color: #1f2937;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+        body { background-color: var(--bg-color); color: var(--text-main); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+        header {
+            background-color: var(--panel-bg);
+            border-bottom: 1px solid var(--border-color);
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .brand { display: flex; align-items: center; gap: 12px; }
+        .brand h1 { font-size: 1.25rem; font-weight: 700; background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .badge { background: #1e293b; color: var(--accent-blue); padding: 4px 8px; border-radius: 6px; font-size: 0.75rem; border: 1px solid var(--accent-blue); }
+
+        .stats-bar { display: flex; gap: 16px; }
+        .stat-card { background: #1f2937; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border-color); text-align: center; }
+        .stat-val { font-size: 1.1rem; font-weight: bold; color: var(--text-main); }
+        .stat-lbl { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; }
+
+        .main-container { display: flex; flex: 1; overflow: hidden; }
+        #network-container { flex: 2; height: 100%; background: #080c14; border-right: 1px solid var(--border-color); position: relative; }
+
+        .sidebar { flex: 1; min-width: 360px; max-width: 480px; background: var(--panel-bg); display: flex; flex-direction: column; height: 100%; }
+        .sidebar-header { padding: 14px; border-bottom: 1px solid var(--border-color); font-weight: 600; font-size: 0.95rem; color: var(--text-muted); display: flex; justify-content: space-between; }
+
+        .event-feed { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+        .event-card { background: #192231; border-radius: 6px; padding: 10px; border-left: 4px solid var(--accent-blue); font-size: 0.82rem; }
+        .event-card.STRUCT_CHANGE { border-left-color: var(--accent-amber); }
+        .event-card.LIFESPAN_SUMMARY { border-left-color: var(--accent-emerald); }
+        .event-card.FREE_DATA { border-left-color: var(--accent-rose); }
+        .event-card.NIC_WAIT { border-left-color: var(--accent-rose); background: #2a1215; }
+
+        .event-top { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 4px; }
+        .event-details { color: var(--text-muted); font-size: 0.76rem; display: flex; flex-direction: column; gap: 2px; }
+
+        .legend { position: absolute; bottom: 16px; left: 16px; background: rgba(17, 24, 39, 0.9); padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color); font-size: 0.75rem; display: flex; flex-direction: column; gap: 6px; z-index: 10; }
+        .legend-item { display: flex; align-items: center; gap: 8px; }
+        .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+
+        .highlight-surviving { background: rgba(245, 158, 11, 0.15); border: 1px solid var(--accent-amber); padding: 6px; border-radius: 6px; margin-top: 4px; color: var(--accent-amber); font-weight: 600; font-size: 0.75rem; }
+        .highlight-nicwait { background: rgba(239, 68, 68, 0.2); border: 1px solid var(--accent-rose); padding: 6px; border-radius: 6px; margin-top: 4px; color: var(--accent-rose); font-weight: 700; font-size: 0.75rem; }
+        .highlight-preempt { background: rgba(139, 92, 246, 0.2); border: 1px solid var(--accent-purple); padding: 6px; border-radius: 6px; margin-top: 4px; color: #a78bfa; font-weight: 700; font-size: 0.75rem; }
+        .highlight-irq { background: rgba(245, 158, 11, 0.2); border: 1px solid var(--accent-amber); padding: 6px; border-radius: 6px; margin-top: 4px; color: #fbbf24; font-weight: 700; font-size: 0.75rem; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="brand">
+            <h1>sk_buff Lifespan & IRQ/Sched Engine</h1>
+            <span class="badge">Hard IRQ & Sched Correlation</span>
+        </div>
+        <div class="stats-bar">
+            <div class="stat-card"><div class="stat-val" id="stat-alloc">0</div><div class="stat-lbl">Allocs</div></div>
+            <div class="stat-card"><div class="stat-val" id="stat-clones" style="color: var(--accent-amber);">0</div><div class="stat-lbl">Clones</div></div>
+            <div class="stat-card"><div class="stat-val" id="stat-splits" style="color: #a78bfa;">0</div><div class="stat-lbl">Splits</div></div>
+            <div class="stat-card"><div class="stat-val" id="stat-appends" style="color: #38bdf8;">0</div><div class="stat-lbl">Appends</div></div>
+            <div class="stat-card"><div class="stat-val" id="stat-gso" style="color: #c084fc;">0</div><div class="stat-lbl">GSO Segs</div></div>
+            <div class="stat-card"><div class="stat-val" id="stat-nicwait" style="color: var(--accent-rose);">0</div><div class="stat-lbl">NIC Wait Alerts</div></div>
+            <div class="stat-card"><div class="stat-val" id="stat-preempt" style="color: var(--accent-purple);">0</div><div class="stat-lbl">CPU Preempts</div></div>
+            <div class="stat-card"><div class="stat-val" id="stat-irqs" style="color: var(--accent-amber);">0</div><div class="stat-lbl">Hard IRQ Stalls</div></div>
+            <div class="stat-card"><div class="stat-val" id="stat-zerodesc" style="color: #f43f5e;">0</div><div class="stat-lbl">0-Desc Risk</div></div>
+            <div class="stat-card"><div class="stat-val" id="stat-headers" style="color: var(--accent-blue);">0</div><div class="stat-lbl">Active SKBs</div></div>
+        </div>
+    </header>
+
+    <div class="main-container">
+        <div id="network-container">
+            <div class="legend">
+                <div class="legend-item"><div class="legend-dot" style="background: var(--accent-blue);"></div> struct sk_buff (Active Header)</div>
+                <div class="legend-item"><div class="legend-dot" style="background: var(--accent-amber);"></div> Shared Data Buffer (Active)</div>
+                <div class="legend-item"><div class="legend-dot" style="background: var(--accent-purple);"></div> CPU Preempted during Refill</div>
+                <div class="legend-item"><div class="legend-dot" style="background: var(--accent-rose);"></div> Hard IRQ Handler Stall</div>
+            </div>
+        </div>
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <span>Refill Latency Root Cause Feed</span>
+                <span id="event-count">0 events</span>
+            </div>
+            <div class="event-feed" id="event-feed"></div>
+        </div>
+    </div>
+
+    <script>
+        const nodes = new vis.DataSet([]);
+        const edges = new vis.DataSet([]);
+        const container = document.getElementById('network-container');
+
+        const data = { nodes: nodes, edges: edges };
+        const options = {
+            nodes: {
+                shape: 'box',
+                font: { color: '#ffffff', size: 12 },
+                borderWidth: 2,
+                shadow: true
+            },
+            edges: {
+                arrows: { to: { enabled: true, scaleFactor: 0.8 } },
+                smooth: { type: 'cubicBezier' },
+                font: { color: '#9ca3af', size: 10, align: 'top' }
+            },
+            physics: {
+                stabilization: false,
+                barnesHut: { gravitationalConstant: -2000, springLength: 100 }
+            }
+        };
+
+        const network = new vis.Network(container, data, options);
+
+        async function fetchGraphData() {
+            try {
+                const res = await fetch('/api/graph');
+                const snapshot = await res.json();
+
+                document.getElementById('stat-alloc').innerText = snapshot.stats.total_allocations;
+                document.getElementById('stat-clones').innerText = snapshot.stats.total_clones;
+                document.getElementById('stat-splits').innerText = snapshot.stats.total_splits || 0;
+                document.getElementById('stat-appends').innerText = snapshot.stats.total_appends || 0;
+                document.getElementById('stat-gso').innerText = snapshot.stats.total_gso_segments || 0;
+                document.getElementById('stat-nicwait').innerText = snapshot.stats.nic_wait_events;
+                document.getElementById('stat-preempt').innerText = snapshot.stats.cpu_preempt_events;
+                document.getElementById('stat-irqs').innerText = snapshot.stats.hard_irq_events;
+                document.getElementById('stat-zerodesc').innerText = snapshot.stats.zero_descriptor_events || 0;
+                document.getElementById('stat-headers').innerText = snapshot.stats.active_skb_headers;
+
+                const newNodes = [];
+                const newEdges = [];
+
+                // SKB Header Nodes
+                snapshot.skbs.forEach(skb => {
+                    const isAlive = skb.status === 'ALIVE';
+                    let color = isAlive ? '#3b82f6' : '#4b5563';
+                    if (skb.zero_descriptors) color = '#dc2626';
+                    else if (skb.irq_preempted) color = '#ef4444';
+                    else if (skb.cpu_preempted) color = '#8b5cf6';
+
+                    const intraUs = (skb.lifespan_ns / 1000).toFixed(1);
+                    const interUs = (skb.inter_cycle_ns / 1000).toFixed(1);
+
+                    newNodes.push({
+                        id: skb.addr,
+                        label: `SKB: ${skb.addr}\nProc: ${intraUs}µs | Refill: ${interUs}µs\nFree Desc: ${skb.free_descriptors || 0} | Tail: ${skb.tail_ptr || 0}`,
+                        color: { background: color, border: skb.nic_wait ? '#ef4444' : '#1d4ed8' },
+                        shape: 'box'
+                    });
+                });
+
+                // Buffer Nodes
+                snapshot.buffers.forEach(buf => {
+                    let color = '#f59e0b';
+                    if (buf.status === 'CLONED_SURVIVING') color = '#ef4444';
+                    else if (buf.status === 'DESTROYED') color = '#374151';
+
+                    newNodes.push({
+                        id: buf.head_addr,
+                        label: `DATA: ${buf.head_addr}\n[dataref=${buf.dataref}]`,
+                        color: { background: color, border: '#b45309' },
+                        shape: 'ellipse'
+                    });
+                });
+
+                // Edges
+                snapshot.edges.forEach(e => {
+                    let edgeColor = '#9ca3af';
+                    if (e.edge_type === 'CLONE') edgeColor = '#f59e0b';
+                    if (e.edge_type === 'COALESCE') edgeColor = '#10b981';
+                    if (e.edge_type === 'SPLIT') edgeColor = '#8b5cf6';
+                    if (e.edge_type === 'APPEND') edgeColor = '#38bdf8';
+                    if (e.edge_type === 'GSO') edgeColor = '#c084fc';
+
+                    newEdges.push({
+                        id: `${e.from}-${e.to}-${e.edge_type}`,
+                        from: e.from,
+                        to: e.to,
+                        label: e.label,
+                        color: { color: edgeColor },
+                        dashes: e.edge_type === 'CLONE'
+                    });
+                });
+
+                nodes.update(newNodes);
+                edges.update(newEdges);
+
+            } catch (err) {
+                console.error("Failed to fetch graph data:", err);
+            }
+        }
+
+        async function fetchEvents() {
+            try {
+                const res = await fetch('/api/events');
+                const events = await res.json();
+
+                const feed = document.getElementById('event-feed');
+                document.getElementById('event-count').innerText = `${events.length} events`;
+                feed.innerHTML = '';
+
+                events.slice().reverse().forEach(e => {
+                    const card = document.createElement('div');
+                    const isNicWait = e.nic_wait;
+                    card.className = `event-card ${e.event_type} ${isNicWait ? 'NIC_WAIT' : ''}`;
+
+                    const intraUs = (e.lifespan_ns / 1000).toFixed(2);
+                    const interUs = (e.inter_cycle_ns / 1000).toFixed(2);
+
+                    let extraInfo = '';
+                    if (e.zero_descriptors) {
+                        extraInfo += `<div class="highlight-nicwait">[NIC HARDWARE FIFO RISK] 0 Free RX Descriptors remaining! High risk of hardware MAC drops!</div>`;
+                    }
+                    if (e.tail_pointer_stalled) {
+                        const stallUs = (e.tail_stall_ns / 1000).toFixed(2);
+                        extraInfo += `<div class="highlight-nicwait">[TAIL POINTER STALL] Driver tail pointer unchanged for ${stallUs} µs (Tail Ptr: ${e.tail_ptr}). System experiencing RX starvation!</div>`;
+                    }
+                    if (e.irq_preempted) {
+                        extraInfo += `<div class="highlight-irq">[HARD IRQ STALL] Driver Interrupt Handler "${e.irq_name}" (IRQ ${e.irq_number}) executed during refill delay (${interUs} µs)!</div>`;
+                    } else if (e.cpu_preempted) {
+                        extraInfo += `<div class="highlight-preempt">[CPU PREEMPTED] CPU context switched to "${e.preempt_comm}" (PID ${e.preempt_pid}, Prio ${e.preempt_prio}) during refill delay (${interUs} µs)!</div>`;
+                    } else if (isNicWait) {
+                        extraInfo += `<div class="highlight-nicwait">[SLAB / MEMORY ALLOCATOR STALL] Refill Latency: ${interUs} µs (>100µs delay)</div>`;
+                    }
+
+                    if (e.threaded_napi) {
+                        extraInfo += `<div style="color: #60a5fa; font-size: 0.72rem; margin-top: 2px;">Context: Threaded NAPI (ksoftirqd)</div>`;
+                    }
+
+                    if (e.event_type === 'STRUCT_CHANGE') {
+                        if (e.func_name === 'skb_clone') {
+                            extraInfo += `<div class="highlight-surviving">[CLONED] Shared Data Buffer ${e.head_addr} (dataref=${e.dataref})</div>`;
+                        } else if (e.func_name === 'tcp_try_coalesce' || e.func_name === 'skb_try_coalesce') {
+                            extraInfo += `<div class="highlight-surviving" style="background: rgba(16, 185, 129, 0.15); border-color: #10b981; color: #10b981;">[COALESCED] SKB ${e.skb_addr} coalesced into SKB ${e.target_skb} (Data merged)</div>`;
+                        } else if (e.func_name === 'skb_split') {
+                            extraInfo += `<div class="highlight-preempt">[SPLIT] SKB ${e.skb_addr} split into child SKB ${e.target_skb}</div>`;
+                        } else if (e.func_name === 'skb_append') {
+                            extraInfo += `<div class="highlight-preempt" style="background: rgba(56, 189, 248, 0.15); border-color: #38bdf8; color: #38bdf8;">[APPEND] Surgical data append from SKB ${e.skb_addr} to ${e.target_skb}</div>`;
+                        } else if (e.func_name === 'skb_segment') {
+                            extraInfo += `<div class="highlight-preempt" style="background: rgba(192, 132, 252, 0.15); border-color: #c084fc; color: #c084fc;">[GSO EGRESS SEGMENTATION] Super-SKB ${e.skb_addr} segmented into egress MTU packet ${e.target_skb}</div>`;
+                        }
+                    }
+
+                    card.innerHTML = `
+                        <div class="event-top">
+                            <span>${e.event_type}</span>
+                            <span>SKB: ${e.skb_addr}</span>
+                        </div>
+                        <div class="event-details">
+                            <div>Processing Latency (Intra-Cycle): ${intraUs} µs</div>
+                            <div>Refill Latency (Inter-Cycle): ${interUs} µs</div>
+                            <div>HW Queue Descriptors: Free=${e.free_descriptors || 0} | Tail Ptr=${e.tail_ptr || 0}</div>
+                            <div>Function: ${e.func_name} | PID: ${e.pid} (${e.comm})</div>
+                            ${e.target_skb ? `<div>Target SKB: ${e.target_skb}</div>` : ''}
+                            ${e.saddr !== '-' ? `<div>Flow: ${e.saddr}:${e.sport} -> ${e.daddr}:${e.dport}</div>` : ''}
+                        </div>
+                        ${extraInfo}
+                    `;
+                    feed.appendChild(card);
+                });
+            } catch (err) {
+                console.error("Failed to fetch events:", err);
+            }
+        }
+
+        setInterval(() => {
+            fetchGraphData();
+            fetchEvents();
+        }, 1000);
+
+        fetchGraphData();
+        fetchEvents();
+    </script>
+</body>
+</html>
